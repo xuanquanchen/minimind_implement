@@ -1,4 +1,6 @@
-from transformers import PretrainedConfig
+from transformers import (
+    PretrainedConfig,
+)
 
 
 class MiniMindConfig(PretrainedConfig):
@@ -21,16 +23,15 @@ class MiniMindConfig(PretrainedConfig):
         rope_theta: int = 1000000,
         inference_rope_scaling: bool = False,
         flash_attention: bool = True,
-        
-        ############ MoE ############
-        use_moe:bool=False,
-        num_experts_per_tok:int=2,
-        n_routed_experts:int=4,
-        n_shared_experts:int=1,
-        scoring_func:str='softmax',
-        aux_loss_alpha:float=0.1,
-        seq_aux:bool=True,
-        norm_topk_prob:bool=True,
+        # MoE ############
+        use_moe: bool = False,
+        num_experts_per_tok: int = 2,
+        n_routed_experts: int = 4,
+        n_shared_experts: int = 1,
+        scoring_func: str = "softmax",
+        aux_loss_alpha: float = 0.1,
+        seq_aux: bool = True,
+        norm_topk_prob: bool = True,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -50,14 +51,14 @@ class MiniMindConfig(PretrainedConfig):
         self.rope_theta = rope_theta
         self.inference_rope_scaling = inference_rope_scaling
         self.flash_attention = flash_attention
-        self.use_moe=use_moe
-        self.num_experts_per_tok=num_experts_per_tok
-        self.n_routed_experts=n_routed_experts
-        self.n_shared_experts=n_shared_experts
-        self.seq_aux=seq_aux
-        self.norm_topk_prob=norm_topk_prob
-        self.aux_loss_alpha=aux_loss_alpha
-        self.scoring_func=scoring_func
+        self.use_moe = use_moe
+        self.num_experts_per_tok = num_experts_per_tok
+        self.n_routed_experts = n_routed_experts
+        self.n_shared_experts = n_shared_experts
+        self.seq_aux = seq_aux
+        self.norm_topk_prob = norm_topk_prob
+        self.aux_loss_alpha = aux_loss_alpha
+        self.scoring_func = scoring_func
 
         self.rope_scaling = (
             {
@@ -70,3 +71,24 @@ class MiniMindConfig(PretrainedConfig):
             if self.inference_rope_scaling
             else None
         )
+
+
+import torch
+import torch.nn as nn
+
+
+class RMSNorm(nn.Module):
+    
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+        
+    def _norm(self, x):
+        return torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+    
+    def forward(self, x):
+        return self.weight * self._norm(x.float()).type_as(x) * x
+        
+
