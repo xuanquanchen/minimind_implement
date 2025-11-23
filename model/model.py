@@ -1,6 +1,11 @@
+from ast import arg
 import math
-from typing import Optional
+from optparse import Option
+from pkgutil import extend_path
+import re
+from typing import Optional, Tuple
 
+from numpy import diag
 from transformers import (
     PretrainedConfig,
 )
@@ -16,7 +21,7 @@ class MiniMindConfig(PretrainedConfig):
         eos_token_id: int = 2,
         hidden_act: str = "silu",
         hidden_size: int = 512,
-        intermediate_size: int = None, # type: ignore
+        intermediate_size: int = None,  # type: ignore
         max_position_embeddings: int = 32768,
         num_attention_heads: int = 8,
         num_hidden_layers: int = 8,
@@ -78,6 +83,7 @@ class MiniMindConfig(PretrainedConfig):
 
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
 
 
 class RMSNorm(nn.Module):
@@ -141,8 +147,153 @@ def precompute_freqs_cis(
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    # [a,b] -> [-b, a]
     def rotate_half(x):
-        return torch.cat([-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]], dim=-1)
-    
-    
+        return torch.cat(
+            [-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]], dim=-1
+        )
+
+    # the unsqueeze here is to make sure the cos and sin can be broadcasted to q/k
+    # because some layout of q/k may be [batch, seq_len, num_heads, head_dim]
+    # instead of [batch, head_dim, seq_len, head_dim]
+    q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (
+        rotate_half(q) * sin.unsqueeze(unsqueeze_dim)
+    )
+    k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (
+        rotate_half(k) * cos.unsqueeze(unsqueeze_dim)
+    )
+
+    return q_embed, k_embed
+
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    bs, slen, num_key_value_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        # expand: does not allocate new memory. It only adjusts strides so that the
+        # tensor appears repeated along the new dimension. The result is non-contiguous.
+        # reshape: used instead of view because expand produces a non-contiguous tensor.
+        # reshape can create a contiguous copy if needed, while view requires
+        # the tensor to be contiguous.
+        x[:, :, :, None, :]
+        .expand(bs, slen, num_key_value_heads, n_rep, head_dim)
+        .reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
+    )
+
+
+class Attention(nn.Module):
+    def __init__(self, args: MiniMindConfig):
+        super().__init__()
+
+        self.num_key_value_heads = (
+            args.num_key_value_heads
+            if args.num_key_value_heads is None
+            else args.num_attention_heads
+        )
+
+        assert args.num_attention_heads % self.num_key_value_heads == 0, (
+            "num_attention_heads must be divisible by num_key_value_heads"
+        )
+
+        self.n_local_heads = args.num_attention_heads
+        self.n_local_kv_heads = args.num_key_value_heads
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = args.hidden_size // args.num_attention_heads
+
+        self.q_proj = nn.Linear(
+            args.hidden_size, args.num_attention_heads * self.head_dim, bias=False
+        )
+        self.k_proj = nn.Linear(
+            args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+
+        self.o_proj = nn.Linear(  # attention weight with bias is meanningless
+            args.num_attention_heads * self.head_dim, args.hidden_size, bias=False
+        )
+
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        self.dropout = args.dropout
+
+        self.flash = (
+            hasattr(torch.nn.functional, "scaled_dot_product_attention")
+            and args.flash_attention
+        )
+
+        def forward(
+            self,
+            x: torch.Tensor,
+            position_embedding: Tuple[torch.Tensor, torch.Tensor],
+            past_kv_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+            use_cache: bool = False,
+            attention_mask: Optional[torch.Tensor] = None,
+        ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+
+            # calculate q, k, v
+            bsz, seq_len, _ = (
+                x.shape
+            )  # all encoder/decoder inputs have shape [bsz, seq_len, hidden_dim] for transformer models
+            xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+            # slipt to multi-heads
+            xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+            xk = xk.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+            xv = xv.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+            # apply RoPE to q, k
+            cos, sin = position_embedding
+            xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
+            # repeat k, v if needed (k v cache)
+            if past_kv_value is not None:
+                xk = torch.cat([past_kv_value[0], xk], dim=1)
+                xv = torch.cat([past_kv_value[1], xv], dim=1)
+            past_kv = (xk, xv) if use_cache else None
+
+            xq, xk, xv = (
+                # pytorch will treat the last two dims as matmul dims, the rest as batch dims
+                xq.transpose(1, 2),
+                repeat_kv(xk, self.n_rep).transpose(1, 2),
+                repeat_kv(xv, self.n_rep).transpose(1, 2),
+            )
+            # attention mechanism
+            if (
+                self.flash
+                and seq_len > 1
+                and (attention_mask is None or torch.all(attention_mask == 1))
+            ):  # flash attention only support causal mask
+                attn_mask = (
+                    None
+                    if attention_mask is None
+                    else attention_mask.view(bsz, 1, 1, -1)
+                    .expand(bsz, self.n_local_heads, seq_len, -1)
+                    .bool()
+                )
+                
+                output = F.scaled_dot_product_attention(
+                    xq, xk, xv, attn_mask=attn_mask,
+                    dropout_p=self.dropout if self.training else 0.0, is_causal=True
+                )
+                
+            else:
+                scores = (xq@xk.transpose(-2,-1)) / math.sqrt(self.head_dim)
+                scores = scores + torch.triu(
+                    torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
+                    diagonal=1
+                ).unsqueeze(0).unsqueeze(0)
+                
+                if attention_mask is not None:
+                    extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                    extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+                    scores = scores + extended_attention_mask
+            
+            # use float32 for numerical stability then cast back to save memory
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            scores = self.attn_dropout(scores)
+            
+            # output projection
+            output = scores @ xv
+            output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+            output = self.resid_dropout(self.o_proj(output))
+
+            return output, past_kv
