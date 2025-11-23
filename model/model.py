@@ -269,28 +269,32 @@ class Attention(nn.Module):
                     .expand(bsz, self.n_local_heads, seq_len, -1)
                     .bool()
                 )
-                
+
                 output = F.scaled_dot_product_attention(
-                    xq, xk, xv, attn_mask=attn_mask,
-                    dropout_p=self.dropout if self.training else 0.0, is_causal=True
+                    xq,
+                    xk,
+                    xv,
+                    attn_mask=attn_mask,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    is_causal=True,
                 )
-                
+
             else:
-                scores = (xq@xk.transpose(-2,-1)) / math.sqrt(self.head_dim)
+                scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
                 scores = scores + torch.triu(
                     torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
-                    diagonal=1
+                    diagonal=1,
                 ).unsqueeze(0).unsqueeze(0)
-                
+
                 if attention_mask is not None:
                     extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
                     extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
                     scores = scores + extended_attention_mask
-            
+
             # use float32 for numerical stability then cast back to save memory
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
-            
+
             # output projection
             output = scores @ xv
             output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
