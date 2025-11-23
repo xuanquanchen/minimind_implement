@@ -84,6 +84,7 @@ class MiniMindConfig(PretrainedConfig):
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from transformers.activations import ACT2FN
 
 
 class RMSNorm(nn.Module):
@@ -301,3 +302,30 @@ class Attention(nn.Module):
             output = self.resid_dropout(self.o_proj(output))
 
             return output, past_kv
+
+
+class FeedForward(nn.Module):
+    def __init__(self, args: MiniMindConfig) -> None:
+        super().__init__()
+
+        # initialization
+        if args.intermediate_size is None:
+            intermediate_size = int(
+                args.hidden_size * 8 / 3
+            )  # 266 for 512 hidden size is good paper: https://arxiv.org/abs/2202.08797
+            args.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+        # up projection\
+        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        # down projection
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
+        # gating
+        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        # dropout
+        self.dropout = nn.Dropout(args.dropout)
+        # activation function
+        self.act_fn = ACT2FN[args.hidden_act]
+
+    def forward(self, x):
+        return self.dropout(
+            self.down_proj(self.act_fn(self.up_proj(x)) * self.gate_proj(x))
+        )
