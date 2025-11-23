@@ -314,7 +314,7 @@ class FeedForward(nn.Module):
                 args.hidden_size * 8 / 3
             )  # 266 for 512 hidden size is good paper: https://arxiv.org/abs/2202.08797
             args.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
-        # up projection\
+        # up projection
         self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
         # down projection
         self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
@@ -322,10 +322,49 @@ class FeedForward(nn.Module):
         self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
         # dropout
         self.dropout = nn.Dropout(args.dropout)
-        # activation function
+        # activation function SiLU
         self.act_fn = ACT2FN[args.hidden_act]
 
     def forward(self, x):
         return self.dropout(
-            self.down_proj(self.act_fn(self.up_proj(x)) * self.gate_proj(x))
+            self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         )
+
+
+class MiniMindBlock(nn.Module):
+    def __init__(self, layer_id: int, config: MiniMindConfig) -> None:
+        super().__init__()
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        self.self_attn = Attention(config)
+
+        self.layer_id = layer_id
+        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.mlp = FeedForward(config)
+
+    def forward(
+        self,
+        hidden_states,
+        position_embeddings,
+        past_key_value=None,
+        use_cache=False,
+        attention_mask=None,
+    ):
+        residual = hidden_states
+        hidden_states, present_key_value = self.self_attn(
+            self.input_layernorm(hidden_states),
+            position_embeddings,
+            past_key_value,
+            use_cache,
+            attention_mask,
+        )
+
+        hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states + self.mlp(
+            self.post_attention_layernorm(hidden_states)
+        )
+
+        return hidden_states, present_key_value
