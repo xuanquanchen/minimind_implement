@@ -1,11 +1,4 @@
-from ast import arg
-import math
-from optparse import Option
-from pkgutil import extend_path
-import re
 from typing import Optional, Tuple
-
-from numpy import diag
 from transformers import (
     PretrainedConfig,
 )
@@ -81,6 +74,7 @@ class MiniMindConfig(PretrainedConfig):
         )
 
 
+import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F

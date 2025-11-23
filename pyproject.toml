@@ -14,10 +14,10 @@ dependencies = [
 [tool.ruff]
 preview = true
 target-version = "py313"
+
+[tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+ignore = ["UP007", "UP035"]
 
 [tool.ruff.format]
 quote-style = "double"
-
-[tool.ruff.lint]
-ignore = ["UP007"]
