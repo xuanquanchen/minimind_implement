@@ -1,4 +1,5 @@
-from typing import Optional, Tuple
+from tracemalloc import start
+from typing import Optional, Sequence, Tuple, List
 from transformers import (
     PretrainedConfig,
 )
@@ -102,7 +103,7 @@ def precompute_freqs_cis(
     rope_base: float = 1e6,
     rope_scaling: Optional[dict] = None,
 ):
-    freqs = 1.0 / rope_base ** torch.arange(0, dim, 2)[: dim // 2].float() / dim
+    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: dim // 2].float() / dim))
 
     # if we use scaling (YaRN or LLaMA-NTK) then we need to modify the freqs
     if rope_scaling is not None:
@@ -154,12 +155,14 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
         rotate_half(q) * sin.unsqueeze(unsqueeze_dim)
     )
     k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (
-        rotate_half(k) * cos.unsqueeze(unsqueeze_dim)
+        rotate_half(k) * sin.unsqueeze(unsqueeze_dim)
     )
 
     return q_embed, k_embed
 
 
+# repeat k, v for multi-head attention when num_key_value_heads < num_attention_heads
+# speed up
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     bs, slen, num_key_value_heads, head_dim = x.shape
     if n_rep == 1:
@@ -180,11 +183,7 @@ class Attention(nn.Module):
     def __init__(self, args: MiniMindConfig):
         super().__init__()
 
-        self.num_key_value_heads = (
-            args.num_key_value_heads
-            if args.num_key_value_heads is None
-            else args.num_attention_heads
-        )
+        self.num_key_value_heads = args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
 
         assert args.num_attention_heads % self.num_key_value_heads == 0, (
             "num_attention_heads must be divisible by num_key_value_heads"
@@ -218,84 +217,84 @@ class Attention(nn.Module):
             and args.flash_attention
         )
 
-        def forward(
-            self,
-            x: torch.Tensor,
-            position_embedding: Tuple[torch.Tensor, torch.Tensor],
-            past_kv_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-            use_cache: bool = False,
-            attention_mask: Optional[torch.Tensor] = None,
-        ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_embedding: Tuple[torch.Tensor, torch.Tensor],
+        past_kv_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
 
-            # calculate q, k, v
-            bsz, seq_len, _ = (
-                x.shape
-            )  # all encoder/decoder inputs have shape [bsz, seq_len, hidden_dim] for transformer models
-            xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-            # slipt to multi-heads
-            xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
-            xk = xk.view(bsz, seq_len, self.n_local_heads, self.head_dim)
-            xv = xv.view(bsz, seq_len, self.n_local_heads, self.head_dim)
-            # apply RoPE to q, k
-            cos, sin = position_embedding
-            xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
-            # repeat k, v if needed (k v cache)
-            if past_kv_value is not None:
-                xk = torch.cat([past_kv_value[0], xk], dim=1)
-                xv = torch.cat([past_kv_value[1], xv], dim=1)
-            past_kv = (xk, xv) if use_cache else None
+        # calculate q, k, v
+        bsz, seq_len, _ = (
+            x.shape
+        )  # all encoder/decoder inputs have shape [bsz, seq_len, hidden_dim] for transformer models
+        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        # slipt to multi-heads
+        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        # apply RoPE to q, k
+        cos, sin = position_embedding
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
+        # repeat k, v if needed (k v cache)
+        if past_kv_value is not None:
+            xk = torch.cat([past_kv_value[0], xk], dim=1)
+            xv = torch.cat([past_kv_value[1], xv], dim=1)
+        past_kv = (xk, xv) if use_cache else None
 
-            xq, xk, xv = (
-                # pytorch will treat the last two dims as matmul dims, the rest as batch dims
-                xq.transpose(1, 2),
-                repeat_kv(xk, self.n_rep).transpose(1, 2),
-                repeat_kv(xv, self.n_rep).transpose(1, 2),
+        xq, xk, xv = (
+            # pytorch will treat the last two dims as matmul dims, the rest as batch dims
+            xq.transpose(1, 2),
+            repeat_kv(xk, self.n_rep).transpose(1, 2),
+            repeat_kv(xv, self.n_rep).transpose(1, 2),
+        )
+        # attention mechanism
+        if (
+            self.flash
+            and seq_len > 1
+            and (attention_mask is None or torch.all(attention_mask == 1))
+        ):  # flash attention only support causal mask
+            attn_mask = (
+                None
+                if attention_mask is None
+                else attention_mask.view(bsz, 1, 1, -1)
+                .expand(bsz, self.n_local_heads, seq_len, -1)
+                .bool()
             )
-            # attention mechanism
-            if (
-                self.flash
-                and seq_len > 1
-                and (attention_mask is None or torch.all(attention_mask == 1))
-            ):  # flash attention only support causal mask
-                attn_mask = (
-                    None
-                    if attention_mask is None
-                    else attention_mask.view(bsz, 1, 1, -1)
-                    .expand(bsz, self.n_local_heads, seq_len, -1)
-                    .bool()
-                )
 
-                output = F.scaled_dot_product_attention(
-                    xq,
-                    xk,
-                    xv,
-                    attn_mask=attn_mask,
-                    dropout_p=self.dropout if self.training else 0.0,
-                    is_causal=True,
-                )
+            output = F.scaled_dot_product_attention(
+                xq,
+                xk,
+                xv,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True,
+            )
 
-            else:
-                scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
-                scores = scores + torch.triu(
-                    torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
-                    diagonal=1,
-                ).unsqueeze(0).unsqueeze(0)
+        else:
+            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            scores = scores + torch.triu(
+                torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
+                diagonal=1,
+            ).unsqueeze(0).unsqueeze(0)
 
-                if attention_mask is not None:
-                    extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-                    extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
-                    scores = scores + extended_attention_mask
+            if attention_mask is not None:
+                extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+                scores = scores + extended_attention_mask
 
-            # use float32 for numerical stability then cast back to save memory
-            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-            scores = self.attn_dropout(scores)
+        # use float32 for numerical stability then cast back to save memory
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        scores = self.attn_dropout(scores)
 
-            # output projection
-            output = scores @ xv
-            output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
-            output = self.resid_dropout(self.o_proj(output))
+        # output projection
+        output = scores @ xv
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = self.resid_dropout(self.o_proj(output))
 
-            return output, past_kv
+        return output, past_kv
 
 
 class FeedForward(nn.Module):
@@ -307,6 +306,8 @@ class FeedForward(nn.Module):
             intermediate_size = int(
                 args.hidden_size * 8 / 3
             )  # 266 for 512 hidden size is good paper: https://arxiv.org/abs/2202.08797
+
+            # make sure Matrix dimensions are multiple of 64/16/32 for better performance
             args.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
         # up projection
         self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
@@ -348,6 +349,7 @@ class MiniMindBlock(nn.Module):
     ):
         residual = hidden_states
         hidden_states, present_key_value = self.self_attn(
+            # for training, the whole sequence is passed, for inference, only the new token is passed
             self.input_layernorm(hidden_states),
             position_embeddings,
             past_key_value,
@@ -361,4 +363,95 @@ class MiniMindBlock(nn.Module):
             self.post_attention_layernorm(hidden_states)
         )
 
-        return hidden_states, present_key_value
+        return hidden_states, present_key_value 
+
+
+class MiniMindModel(nn.Module):
+    freqs_cos: torch.Tensor
+    freqs_sin: torch.Tensor
+    
+    def __init__(self, config: MiniMindConfig) -> None:
+        super().__init__()
+        self.vocab_size, self.num_hidden_layers = (
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+        
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+        self.layers = nn.ModuleList(
+            [MiniMindBlock(i, config) for i in range(config.num_hidden_layers)]
+        )
+        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        
+        # precompute RoPE embeddings
+        freqs_cos, freqs_sin = precompute_freqs_cis(
+            dim=config.hidden_size // config.num_attention_heads,
+            end=config.max_position_embeddings,
+            rope_base=config.rope_theta,
+            rope_scaling=config.rope_scaling,
+        )
+        
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+        
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[
+            Sequence[Optional[Tuple[torch.Tensor, torch.Tensor]]]
+        ] = None,
+        use_cache: bool = False,
+        **kwargs,
+    ):
+        
+        assert input_ids is not None, "input_ids cannot be None"
+        batch_size, seq_length = input_ids.shape
+        
+        # for huggingface compatibility, HF will package the whole past_key_values
+        # into a object with attribute "layers" like:
+        # past_key_values: BaseModelOutputWithPast(
+        #   last_hidden_state=tensor(...),
+        #   past_key_values=[...],
+        # )
+        if hasattr(past_key_values, "layers"):
+            past_key_values = None
+        
+        past_key_values = past_key_values or [None] * len(self.layers)
+        
+        # current generation position
+        start_pos = (
+            past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        )
+        
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+        
+        position_embeddings = (
+            self.freqs_cos[start_pos : start_pos + seq_length],
+            self.freqs_sin[start_pos : start_pos + seq_length],
+        )
+
+        # kv cache
+        presents_kv = []
+        
+        # iterate over each transformer layer like (layer0, past_kv0), ...
+        for layer_idx, (layer, past_kv) in enumerate(
+            zip(self.layers, past_key_values)
+        ):
+            hidden_states, present_kv = layer(
+                hidden_states,
+                position_embeddings,
+                past_key_value=past_kv,
+                use_cache=use_cache,
+                attention_mask=attention_mask,
+            )
+            
+            # store the present key value for kv cache
+            presents_kv.append(present_kv)
+        
+        hidden_states = self.norm(hidden_states)
+        
+        # Backbone outputs
+        return hidden_states, presents_kv
+    
