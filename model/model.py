@@ -1,6 +1,8 @@
-from tracemalloc import start
-from typing import Optional, Sequence, Tuple, List
+from typing import Optional, Sequence, Tuple, Union
+from sympy import Union
 from transformers import (
+    GenerationMixin,
+    PreTrainedModel,
     PretrainedConfig,
 )
 
@@ -80,6 +82,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from transformers.activations import ACT2FN
+from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 class RMSNorm(nn.Module):
@@ -455,3 +459,67 @@ class MiniMindModel(nn.Module):
         # Backbone outputs
         return hidden_states, presents_kv
     
+
+class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
+    # with language modeling head for huggingface compatibility
+    # PreTrainedModel defines some functions for loading/saving weights
+    # GenerationMixin defines some functions for generation
+    
+    config_class = MiniMindConfig
+    
+    def __init__(self, config: MiniMindConfig | None = None):
+        self.config = config or MiniMindConfig()
+        super().__init__(self.config)
+        
+        self.model = MiniMindModel(self.config)
+        
+        # language modeling head
+        self.lm_head = nn.Linear(
+            self.config.hidden_size, self.config.vocab_size, bias=False
+        )
+        
+        # weight tying: let the output embedding weight equal to input embedding weight
+        # save memory and improve performance
+        self.model.embed_tokens.weight = self.lm_head.weight
+        
+        self.OUT = CausalLMOutputWithPast()
+        
+    def forward(
+        self, 
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[
+            Sequence[Optional[Tuple[torch.Tensor]]]
+        ] = None,
+        use_cache: bool = False,
+        logits_to_keep: int | torch.Tensor | None = None,
+        **args):
+        
+        # hidden states size: (batch_size, seq_length, hidden_size)
+        hidden_states, past_key_values = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **args
+        )
+        
+        # If logits_to_keep is int, keep the last n logits (typically 1)
+        #    when generating, we only need the last logits for the new token in inference
+        # If logits_to_keep is tensor, we let this equal to zero to keep all logits for training
+        slice_indices = (
+            slice(-logits_to_keep, None) 
+            if isinstance(logits_to_keep, int)
+            else logits_to_keep
+        )
+        
+        logits = self.lm_head(hidden_states)[:, slice_indices, :]
+        
+        # Define output
+        # we don't do softmax here because GenerationMixin in HF
+        # will do softmax when sampling
+        self.OUT.__setitem__("last_hidden_state", hidden_states)
+        self.OUT.__setitem__("logits", logits)
+        self.OUT.__setitem__("past_key_values", past_key_values)
+        
+        return self.OUT
